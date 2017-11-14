@@ -53,6 +53,30 @@ function test()
     put_from_file(tfh, "data/input/unsuback.dat")
     @test is_out_correct("data/output/unsubreq.dat", tfh.out_channel)
 
+    #TODO attempted tests for handle packages
+    info("Testing handle_pubrec")
+    handle_pubrec(client, "abc", "QOS_2", qos=0x02)
+    put_from_file(tfh, "data/input/pubrecack.dat")
+    @test is_out_correct("data/output/pubreq.dat", tfh.out_channel)
+
+    info("Testing handle_pubrel")
+    handle_pubrel(client, "abc", "QOS_2" qos=0x02)
+    put_from_file(tfh, "data/input/pubrelack.dat")
+    @test is_out_correct("data/output/pubrelreq.dat", tfh.out_channel)
+
+
+    info("Testing handle_suback")
+    handle_suback(client, "abc", "QOS_2" qos=0x02)
+    put_from_file(tfh, "data/input/suback.dat")
+    @test is_out_correct("data/output/subackreq.dat", tfh.out_channel)
+
+    info("Testing handle_pingresp")
+    handle_pingresp(client, "abc", "QOS_2" qos=0x02)
+    put_from_file(tfh, "data/input/pingrespack.dat")
+    @test is_out_correct("data/output/pingrespack.dat", tfh.out_channel)
+
+    # END attempted tests
+
     info("Testing disconnect")
     disconnect(client)
     @test is_out_correct("data/output/disco.dat", tfh.out_channel)
