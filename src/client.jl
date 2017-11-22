@@ -1,4 +1,5 @@
-import Base.connect
+import Base: connect, Dates.second, ReentrantLock, lock, unlock
+importall Base.Threads
 
 # commands
 const CONNECT = 0x10
@@ -66,8 +67,14 @@ mutable struct Client
 
     write_packets::Channel{Packet}
     socket
+    socket_lock
 
-    received_pingresp::Bool
+    ping_timeout::UInt64
+
+    # TODO mutex
+    ping_outstanding::Atomic{UInt8}
+    last_sent::Atomic{Float64}
+    last_received::Atomic{Float64}
 
     Client(on_msg) = new(
     on_msg,
@@ -76,16 +83,20 @@ mutable struct Client
     Dict{UInt16, Future}(),
     Channel{Packet}(60),
     TCPSocket(),
-    false)
+    ReentrantLock(),
+    60,
+    Atomic{UInt8}(0),
+    Atomic{Float64}(),
+    Atomic{Float64}())
 end
 
-const CONNACK_STRINGS = [
-"connection refused unacceptable protocol version",
-"connection refused identifier rejected",
-"connection refused server unavailable",
-"connection refused bad user name or password",
-"connection refused not authorized",
-]
+const CONNACK_ERRORS = Dict{UInt8, String}(
+0x01 => "connection refused unacceptable protocol version",
+0x02 => "connection refused identifier rejected",
+0x03 => "connection refused server unavailable",
+0x04 => "connection refused bad user name or password",
+0x05 => "connection refused not authorized",
+)
 
 function handle_connack(client::Client, s::IO, cmd::UInt8, flags::UInt8)
     session_present = read(s, UInt8)
@@ -95,16 +106,8 @@ function handle_connack(client::Client, s::IO, cmd::UInt8, flags::UInt8)
     if return_code == CONNECTION_ACCEPTED
         put!(future, session_present)
     else
-        try
-            put!(future, MQTTException(CONNACK_STRINGS[return_code]))
-        catch e
-            if isa(e, BoundsError)
-                put!(future, MQTTException("unkown return code [" + return_code + "]"))
-                # TODO close connection
-            else
-                rethrow()
-            end
-        end
+        error = get(CONNACK_ERRORS, return_code, "unkown return code [" + return_code + "]")
+        put!(future, MQTTException(error))
     end
 end
 
@@ -129,10 +132,16 @@ function handle_publish(client::Client, s::IO, cmd::UInt8, flags::UInt8)
     @schedule client.on_msg(topic, payload)
 end
 
-#TODO what kind of ack?
 function handle_ack(client::Client, s::IO, cmd::UInt8, flags::UInt8)
     id = mqtt_read(s, UInt16)
-    put!(client.in_flight[id], nothing)
+    # TODO move this to its own function
+    if haskey(client.in_flight, id)
+        future = client.in_flight[id]
+        put!(future, nothing)
+        delete!(client.in_flight, id)
+    else
+        # TODO unexpected ack protocol error
+    end
 end
 
 function handle_pubrec(client::Client, s::IO, cmd::UInt8, flags::UInt8)
@@ -152,15 +161,15 @@ function handle_suback(client::Client, s::IO, cmd::UInt8, flags::UInt8)
 end
 
 function handle_pingresp(client::Client, s::IO, cmd::UInt8, flags::UInt8)
-    if client.received_pingresp == false
-      client.received_pingresp = true
+    if client.ping_outstanding[] == 0x1
+      atomic_xchg!(client.ping_outstanding, 0x0)
     else
       # We received a subresp packet we didn't ask for
       disconnect(client)
     end
 end
 
-const handlers = Dict{UInt8, Function}(
+const HANDLERS = Dict{UInt8, Function}(
 CONNACK => handle_connack,
 PUBLISH => handle_publish,
 PUBACK => handle_ack,
@@ -190,9 +199,12 @@ function write_loop(client)
                 mqtt_write(buffer, i)
             end
             data = take!(buffer)
+            lock(client.socket_lock)
             write(client.socket, packet.cmd)
             write_len(client.socket, length(data))
             write(client.socket, data)
+            unlock(client.socket_lock)
+            atomic_xchg!(client.last_sent, time())
         end
     catch e
         # channel closed
@@ -213,9 +225,13 @@ function read_loop(client)
             buffer = PipeBuffer(data)
             cmd = cmd_flags & 0xF0
             flags = cmd_flags & 0x0F
-            # TODO check contains
-            # TODO handle errors
-            handlers[cmd](client, buffer, cmd, flags)
+
+            if haskey(HANDLERS, cmd)
+                atomic_xchg!(client.last_received, time())
+                HANDLERS[cmd](client, buffer, cmd, flags)
+            else
+                # TODO unexpected cmd protocol error
+            end
         end
     catch e
         # socket closed
@@ -226,26 +242,53 @@ function read_loop(client)
 end
 
 function keep_alive_loop(client::Client)
+    ping_sent = time()
+
+    if client.keep_alive > 10
+      check_interval = 5
+    else
+      check_interval = client.keep_alive / 2
+    end
+    timer = Timer(0, check_interval)
+
     while true
-      try
-        write_packet(client, PINGREQ) # TODO test if this leads to time issues and put a socket mutex and write here directly if it does
-      catch e
-        if isa(e, InvalidStateException)
-          # A disconnect has happened -> Stop the loop
-          break;
-        else
-          rethrow()
+      if time() - client.last_sent[] >= client.keep_alive || time() - client.last_received[] >= client.keep_alive
+        if client.ping_outstanding[] == 0x0
+          atomic_xchg!(client.ping_outstanding, 0x1)
+          try
+            lock(client.socket_lock)
+            write(client.socket, PINGREQ)
+            write(client.socket, 0x00)
+            unlock(client.socket_lock)
+            atomic_xchg!(client.last_sent, time())
+          catch e
+              if isa(e, InvalidStateException)
+                  break
+                  # TODO is this the socket closed exception? Handle accordingly
+              else
+                  rethrow()
+              end
+          end
+          ping_sent = time()
         end
       end
-      sleep(client.keep_alive)
 
-      if client.received_pingresp == false
-        # No pingresp received
-        disconnect(client)
-        #TODO automatic reconnect
-      else
-        client.received_pingresp = false
+      if client.ping_outstanding[] == 1 && time() - ping_sent >= client.ping_timeout
+        try # No pingresp received
+          disconnect(client)
+          break
+        catch e
+            # channel closed
+            if isa(e, InvalidStateException)
+                break
+            else
+                rethrow()
+            end
+        end
+        # TODO automatic reconnect
       end
+
+      wait(timer)
     end
 end
 
@@ -320,6 +363,7 @@ function disconnect(client)
     wait(client.socket.closenotify)
 end
 
+# TODO change topics to Tuple{String, UInt8}
 function subscribe_async(client, topics...)
     future = Future()
     id = packet_id(client)
@@ -328,11 +372,7 @@ function subscribe_async(client, topics...)
     return future
 end
 
-# TODO change topics to Tuple{String, UInt8}
-function subscribe(client, topics...)
-    future = subscribe_async(client, topics...)
-    return get(future)
-end
+subscribe(client, topics...) = get(subscribe_async(client, topics...))
 
 function unsubscribe_async(client, topics...)
     future = Future()
@@ -342,10 +382,7 @@ function unsubscribe_async(client, topics...)
     return future
 end
 
-function unsubscribe(client, topics...)
-    future = unsubscribe_async(client, topics...)
-    return get(future)
-end
+unsubscribe(client, topics...) = get(unsubscribe_async(client, topics...))
 
 function publish_async(client::Client, message::Message)
     future = Future()
@@ -365,16 +402,12 @@ function publish_async(client::Client, message::Message)
     return future
 end
 
-function publish_async(client::Client, topic::String, payload...;
+publish_async(client::Client, topic::String, payload...;
     dup::Bool=false,
     qos::UInt8=0x00,
-    retain::Bool=false)
-    return publish_async(client, Message(dup, qos, retain, topic, payload...))
-end
+    retain::Bool=false) = publish_async(client, Message(dup, qos, retain, topic, payload...))
 
-function publish(client::Client, topic::String, payload...;
+publish(client::Client, topic::String, payload...;
     dup::Bool=false,
     qos::UInt8=0x00,
-    retain::Bool=false)
-    get(publish_async(client, topic, payload..., dup=dup, qos=qos, retain=retain))
-end
+    retain::Bool=false) = get(publish_async(client, topic, payload..., dup=dup, qos=qos, retain=retain))
